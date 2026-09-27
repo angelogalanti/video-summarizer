@@ -24,6 +24,30 @@ from pathlib import Path
 import cv2
 from faster_whisper import WhisperModel
 
+
+def _preload_nvidia_cuda_libs() -> None:
+    """dlopen NVIDIA pip wheels by absolute path (ctypes, RTLD_GLOBAL) so
+    ctranslate2 finds libcublas/cudnn without system CUDA toolkit or
+    LD_LIBRARY_PATH. No-op on CPU-only machines.
+    # ponytail: loads every .so in nvidia/*/lib; per-lib selection if startup cost matters."""
+    import ctypes
+    import glob as _glob
+    from pathlib import Path as _Path
+    base = _Path(sys.prefix)
+    libs = sorted(_glob.glob(str(base / "lib" / "python*" / "site-packages"
+                                    / "nvidia" / "*" / "lib" / "*.so*")))
+    for _pass in (1, 2):  # 2nd pass retries libs whose deps load later
+        for so in libs:
+            if _Path(so).is_dir():
+                continue
+            try:
+                ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_preload_nvidia_cuda_libs()
+
 from scenedetect import open_video, SceneManager
 from scenedetect.detectors import ContentDetector
 
@@ -78,6 +102,21 @@ def extract_audio(video_path: Path, output_wav: str) -> None:
 # Phase 2 – Transcription
 # ---------------------------------------------------------------------------
 
+def _run_transcribe(model, audio_path: str) -> list[tuple[float, str]]:
+    """Run model.transcribe + materialize segments (errors surface here,
+    inside the caller's try so auto-fallback catches transcribe-time CUDA
+    failures, not just model-load ones)."""
+    print(f"[transcribe] Transcribing ...")
+    segments, info = model.transcribe(audio_path, beam_size=5)
+    print(f"[transcribe] Language: {info.language} "
+          f"(p={info.language_probability:.2f})")
+
+    result: list[tuple[float, str]] = []
+    for seg in segments:
+        result.append((seg.start, seg.text.strip()))
+    return result
+
+
 def transcribe(audio_path: str, model_name: str = "base",
                device: str = "auto") -> list[tuple[float, str]]:
     """Transcribe *audio_path* via faster-whisper.
@@ -101,6 +140,7 @@ def transcribe(audio_path: str, model_name: str = "base",
             device=dev,
             compute_type=compute_type,
         )
+        return _run_transcribe(model, audio_path)
     except Exception as exc:
         if device == "auto":
             print(f"[transcribe] CUDA failed ({exc}), falling back to CPU ...")
@@ -110,6 +150,7 @@ def transcribe(audio_path: str, model_name: str = "base",
                     device="cpu",
                     compute_type="int8",
                 )
+                return _run_transcribe(model, audio_path)
             except Exception as exc2:
                 raise RuntimeError(
                     f"Failed to load whisper model '{model_name}': {exc2}"
@@ -118,16 +159,6 @@ def transcribe(audio_path: str, model_name: str = "base",
             raise RuntimeError(
                 f"Failed to load whisper model '{model_name}': {exc}"
             ) from exc
-
-    print(f"[transcribe] Transcribing ...")
-    segments, info = model.transcribe(audio_path, beam_size=5)
-    print(f"[transcribe] Language: {info.language} "
-          f"(p={info.language_probability:.2f})")
-
-    result: list[tuple[float, str]] = []
-    for seg in segments:
-        result.append((seg.start, seg.text.strip()))
-    return result
 
 
 def save_transcript(data: list[tuple[float, str]], dest: Path) -> None:
